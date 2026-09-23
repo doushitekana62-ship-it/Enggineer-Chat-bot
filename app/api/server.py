@@ -1,10 +1,11 @@
 from typing import Any
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from app.database.service import DatabaseService
-from app.ai.ollama import OllamaService
 from app import config
+from app.ai.ollama import OllamaService
+from app.database.service import DatabaseService
 
 app = FastAPI(
     title="Engineer Chat Bot",
@@ -20,6 +21,15 @@ class ChatRequest(BaseModel):
     question: str
 
 
+@app.get("/")
+def root() -> dict[str, str]:
+    return {
+        "name": "Engineer Chat Bot",
+        "version": "0.1.0-prototype",
+        "message": "Prototype is running.",
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -33,13 +43,14 @@ def health() -> dict[str, Any]:
 
 @app.post("/chat")
 def chat(request: ChatRequest) -> dict[str, Any]:
-    context = db.get_context(request.question)
-
-    if not request.question.strip():
+    question = request.question.strip()
+    if not question:
         return {"success": False, "error": "Question is empty."}
 
+    context = db.get_context(question)
+
     try:
-        answer = ollama.chat(request.question, context)
+        answer = ollama.chat(question, context)
         return {
             "success": True,
             "answer": answer,
@@ -50,7 +61,7 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         return {
             "success": False,
             "answer": None,
-            "error": f"Ollama is unavailable: {exc}",
+            "error": str(exc),
             "data_source": context.get("source"),
             "demo_mode": config.DEMO_MODE,
         }
