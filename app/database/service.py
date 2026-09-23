@@ -1,25 +1,27 @@
 from typing import Any
+
 import psycopg2
+
 from app import config
 
 DEMO_PROJECTS = [
     {
         "project_no": "DEMO-001",
-        "project_name": "Demo Automation Project",
+        "project_name": "Automation Line A",
         "status": "ACTIVE",
         "customer": "Demo Customer",
         "engineer": "Engineer A",
     },
     {
         "project_no": "DEMO-002",
-        "project_name": "Demo Conveyor Project",
+        "project_name": "Conveyor System B",
         "status": "ACTIVE",
         "customer": "Demo Customer",
         "engineer": "Engineer B",
     },
     {
         "project_no": "DEMO-003",
-        "project_name": "Demo Completed Project",
+        "project_name": "Fixture Project C",
         "status": "COMPLETED",
         "customer": "Demo Customer",
         "engineer": "Engineer C",
@@ -33,7 +35,7 @@ class DatabaseService:
             return {
                 "connected": False,
                 "mode": "demo",
-                "message": "Office Engineering database is not connected. Demo data is active.",
+                "message": "Live Engineering database is not connected. Prototype demo data is active.",
             }
 
         try:
@@ -41,7 +43,11 @@ class DatabaseService:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     cur.fetchone()
-            return {"connected": True, "mode": "postgresql", "message": "Database connected."}
+            return {
+                "connected": True,
+                "mode": "postgresql",
+                "message": "Engineering PostgreSQL database connected.",
+            }
         except Exception as exc:
             return {
                 "connected": False,
@@ -54,11 +60,9 @@ class DatabaseService:
             return {
                 "source": "demo",
                 "data": DEMO_PROJECTS,
-                "note": "This is prototype data, not live Engineering data.",
+                "note": "DEMO ONLY. Data is fictional and must not be presented as live company data.",
             }
 
-        # The exact office query layer will be mapped from the VB services
-        # when the real database connection is available.
         try:
             with self._connect() as conn:
                 with conn.cursor() as cur:
@@ -82,17 +86,21 @@ class DatabaseService:
                     }
                     for row in rows
                 ],
+                "note": "Live database context.",
             }
         except Exception as exc:
             return {
                 "source": "postgresql-error",
                 "data": [],
-                "note": f"Database unavailable: {exc}",
+                "note": f"Live database unavailable: {exc}",
             }
 
     def _connect(self):
         if not all([config.DB_HOST, config.DB_NAME, config.DB_USER]):
-            raise RuntimeError("PostgreSQL configuration is incomplete.")
+            raise RuntimeError(
+                "PostgreSQL configuration is incomplete. "
+                "Set DB_HOST, DB_NAME and DB_USER in .env."
+            )
 
         return psycopg2.connect(
             host=config.DB_HOST,
