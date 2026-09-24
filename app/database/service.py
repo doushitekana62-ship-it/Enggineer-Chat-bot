@@ -54,7 +54,7 @@ class DatabaseService:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT project_no, project_name, status
+                        SELECT project_no, project_name, status_project
                         FROM projects
                         ORDER BY project_no
                         LIMIT 100
@@ -139,20 +139,20 @@ class DatabaseService:
 
     @staticmethod
     def _extract_year(question: str) -> str | None:
-        match = re.search(r"\\b(20\\d{2})\\b", question)
+        match = re.search(r"\b(20\d{2})\b", question)
         return match.group(1) if match else None
 
     @staticmethod
     def _extract_project_type(question: str) -> str | None:
         match = re.search(
-            r"\\b(?:type|tipe)\\s*[:=]?\\s*([NR])\\b|\\btype\\s+([NR])\\b",
+            r"\b(?:type|tipe)\s*[:=]?\s*([NR])\b|\btype\s+([NR])\b",
             question,
             flags=re.IGNORECASE,
         )
         if match:
             return (match.group(1) or match.group(2)).upper()
 
-        if re.search(r"\\bnew\\b", question, flags=re.IGNORECASE):
+        if re.search(r"\bnew\b", question, flags=re.IGNORECASE):
             return "N"
 
         return None
