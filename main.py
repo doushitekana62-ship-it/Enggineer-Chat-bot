@@ -1,4 +1,6 @@
 import threading
+from pathlib import Path
+import sys
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -127,6 +129,11 @@ class EngineerAIApp:
         self.answer.pack(fill="both", expand=True)
         self.answer.configure(state="disabled")
 
+    @staticmethod
+    def _env_path() -> Path:
+        base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+        return base / ".env"
+
     def _write_status(self, text: str):
         self.status_text.configure(state="normal")
         self.status_text.delete("1.0", "end")
@@ -138,15 +145,15 @@ class EngineerAIApp:
         ollama = self.ollama.status()
 
         text = (
-            f"MODE: {'DEMO' if config.DEMO_MODE else 'LIVE'}\\n\\n"
-            f"DATABASE\\n"
-            f"  Connected : {db.get('connected')}\\n"
-            f"  Mode      : {db.get('mode')}\\n"
-            f"  Message   : {db.get('message')}\\n\\n"
-            f"OLLAMA\\n"
-            f"  Connected : {ollama.get('connected')}\\n"
-            f"  Model     : {ollama.get('model')}\\n"
-            f"  Available : {ollama.get('model_available')}\\n"
+            f"MODE: {'DEMO' if config.DEMO_MODE else 'LIVE'}\n\n"
+            f"DATABASE\n"
+            f"  Connected : {db.get('connected')}\n"
+            f"  Mode      : {db.get('mode')}\n"
+            f"  Message   : {db.get('message')}\n\n"
+            f"OLLAMA\n"
+            f"  Connected : {ollama.get('connected')}\n"
+            f"  Model     : {ollama.get('model')}\n"
+            f"  Available : {ollama.get('model_available')}\n"
         )
 
         self._write_status(text)
@@ -159,7 +166,7 @@ class EngineerAIApp:
             config.DB_USER = self.db_vars["user"].get().strip()
             config.DB_PASSWORD = self.db_vars["password"].get()
 
-            with open(".env", "w", encoding="utf-8") as file:
+            with open(self._env_path(), "w", encoding="utf-8") as file:
                 file.write("DEMO_MODE=false\\n")
                 file.write(f"OLLAMA_URL={config.OLLAMA_URL}\\n")
                 file.write(f"OLLAMA_MODEL={config.OLLAMA_MODEL}\\n")
@@ -206,7 +213,7 @@ class EngineerAIApp:
                 context = self.db.get_context(question)
                 answer = self.ollama.chat(question, context)
                 result = (
-                    f"{answer}\\n\\n"
+                    f"{answer}\n\n"
                     f"[Data source: {context.get('source')}]"
                 )
             except Exception as exc:
