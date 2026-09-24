@@ -24,12 +24,13 @@ def start_api():
 class EngineerAIApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Engineer AI - Prototype")
-        self.root.geometry("760x600")
-        self.root.minsize(700, 520)
+        self.root.title("Engineer AI")
+        self.root.geometry("900x680")
+        self.root.minsize(760, 560)
 
         self.db = DatabaseService()
         self.ollama = OllamaService()
+        self.chat_widgets = []
 
         self.db_vars = {
             "host": tk.StringVar(value=config.DB_HOST),
@@ -42,28 +43,121 @@ class EngineerAIApp:
         self._build_ui()
         self.refresh_status()
 
+    @staticmethod
+    def _env_path() -> Path:
+        base = (
+            Path(sys.executable).resolve().parent
+            if getattr(sys, "frozen", False)
+            else Path(__file__).resolve().parent
+        )
+        return base / ".env"
+
     def _build_ui(self):
         notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+        notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
         settings = ttk.Frame(notebook, padding=15)
-        chat = ttk.Frame(notebook, padding=15)
+        chat = ttk.Frame(notebook, padding=12)
+        notebook.add(chat, text="Chat")
         notebook.add(settings, text="Database Settings")
-        notebook.add(chat, text="AI Chat")
+
+        self._build_chat(chat)
+        self._build_settings(settings)
+
+    def _build_chat(self, parent):
+        header = ttk.Frame(parent)
+        header.pack(fill="x", pady=(0, 8))
 
         ttk.Label(
-            settings,
+            header,
+            text="Engineering Assistant",
+            font=("Segoe UI", 16, "bold"),
+        ).pack(side="left")
+
+        self.connection_label = ttk.Label(
+            header,
+            text="Checking connection...",
+            foreground="#666666",
+        )
+        self.connection_label.pack(side="right", pady=4)
+
+        chat_box = ttk.Frame(parent)
+        chat_box.pack(fill="both", expand=True)
+
+        self.chat_canvas = tk.Canvas(
+            chat_box,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            chat_box,
+            orient="vertical",
+            command=self.chat_canvas.yview,
+        )
+        self.chat_canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        self.chat_canvas.pack(side="left", fill="both", expand=True)
+
+        self.chat_frame = tk.Frame(self.chat_canvas)
+        self.chat_window = self.chat_canvas.create_window(
+            (0, 0),
+            window=self.chat_frame,
+            anchor="nw",
+        )
+
+        self.chat_frame.bind(
+            "<Configure>",
+            lambda event: self.chat_canvas.configure(
+                scrollregion=self.chat_canvas.bbox("all")
+            ),
+        )
+        self.chat_canvas.bind(
+            "<Configure>",
+            lambda event: self.chat_canvas.itemconfigure(
+                self.chat_window,
+                width=event.width,
+            ),
+        )
+
+        self._add_message(
+            "assistant",
+            "Halo. Saya Engineer AI. Silakan tanyakan data Engineering.",
+        )
+
+        composer = ttk.Frame(parent)
+        composer.pack(fill="x", pady=(10, 0))
+
+        self.question = tk.Text(
+            composer,
+            height=3,
+            wrap="word",
+            font=("Segoe UI", 10),
+        )
+        self.question.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        self.question.bind("<Control-Return>", lambda event: self.ask_question())
+
+        ttk.Button(
+            composer,
+            text="Kirim",
+            command=self.ask_question,
+            width=10,
+        ).pack(side="right", fill="y")
+
+    def _build_settings(self, parent):
+        ttk.Label(
+            parent,
             text="Engineering Database Connection",
             font=("Segoe UI", 14, "bold"),
         ).pack(anchor="w")
 
         ttk.Label(
-            settings,
-            text="Masukkan credential PostgreSQL kantor. Data disimpan lokal di file .env.",
+            parent,
+            text="Masukkan credential PostgreSQL. Konfigurasi disimpan secara lokal.",
             foreground="#555555",
         ).pack(anchor="w", pady=(4, 15))
 
-        form = ttk.Frame(settings)
+        form = ttk.Frame(parent)
         form.pack(fill="x")
 
         labels = [
@@ -85,7 +179,7 @@ class EngineerAIApp:
 
         form.columnconfigure(1, weight=1)
 
-        buttons = ttk.Frame(settings)
+        buttons = ttk.Frame(parent)
         buttons.pack(anchor="w", pady=15)
 
         ttk.Button(
@@ -100,39 +194,58 @@ class EngineerAIApp:
             command=self.refresh_status,
         ).pack(side="left")
 
-        self.status_text = tk.Text(settings, height=12, wrap="word")
+        self.status_text = tk.Text(parent, height=12, wrap="word")
         self.status_text.pack(fill="both", expand=True, pady=(5, 0))
         self.status_text.configure(state="disabled")
 
-        ttk.Label(
-            chat,
-            text="Engineering AI Chat",
-            font=("Segoe UI", 14, "bold"),
-        ).pack(anchor="w")
+    def _add_message(self, role: str, text: str):
+        row = tk.Frame(self.chat_frame)
+        row.pack(fill="x", padx=8, pady=5)
 
-        ttk.Label(
-            chat,
-            text="Prototype query:",
-            foreground="#555555",
-        ).pack(anchor="w", pady=(4, 5))
+        if role == "user":
+            bubble = tk.Label(
+                row,
+                text=text,
+                justify="left",
+                anchor="w",
+                wraplength=620,
+                padx=12,
+                pady=8,
+                bg="#E8F0FE",
+                fg="#202124",
+                font=("Segoe UI", 10),
+            )
+            bubble.pack(side="right", padx=(100, 0))
+        else:
+            bubble = tk.Label(
+                row,
+                text=text,
+                justify="left",
+                anchor="w",
+                wraplength=620,
+                padx=12,
+                pady=8,
+                bg="#F1F3F4",
+                fg="#202124",
+                font=("Segoe UI", 10),
+            )
+            bubble.pack(side="left", padx=(0, 100))
 
-        self.question = tk.Text(chat, height=5, wrap="word")
-        self.question.pack(fill="x")
+        self.chat_widgets.append(row)
+        self.root.after_idle(
+            lambda: self.chat_canvas.yview_moveto(1.0)
+        )
 
-        ttk.Button(
-            chat,
-            text="Ask Llama 3.2 3B",
-            command=self.ask_question,
-        ).pack(anchor="w", pady=10)
-
-        self.answer = tk.Text(chat, wrap="word")
-        self.answer.pack(fill="both", expand=True)
-        self.answer.configure(state="disabled")
-
-    @staticmethod
-    def _env_path() -> Path:
-        base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-        return base / ".env"
+    def _add_status_message(self, source: str):
+        label = tk.Label(
+            self.chat_frame,
+            text=f"Sumber data: {source}",
+            anchor="w",
+            fg="#777777",
+            font=("Segoe UI", 8),
+        )
+        label.pack(fill="x", padx=14, pady=(0, 5))
+        self.chat_widgets.append(label)
 
     def _write_status(self, text: str):
         self.status_text.configure(state="normal")
@@ -143,6 +256,14 @@ class EngineerAIApp:
     def refresh_status(self):
         db = self.db.status()
         ollama = self.ollama.status()
+
+        self.connection_label.configure(
+            text=(
+                "Database terhubung"
+                if db.get("connected")
+                else "Database belum terhubung"
+            )
+        )
 
         text = (
             f"MODE: {'DEMO' if config.DEMO_MODE else 'LIVE'}\n\n"
@@ -167,14 +288,14 @@ class EngineerAIApp:
             config.DB_PASSWORD = self.db_vars["password"].get()
 
             with open(self._env_path(), "w", encoding="utf-8") as file:
-                file.write("DEMO_MODE=false\\n")
-                file.write(f"OLLAMA_URL={config.OLLAMA_URL}\\n")
-                file.write(f"OLLAMA_MODEL={config.OLLAMA_MODEL}\\n")
-                file.write(f"DB_HOST={config.DB_HOST}\\n")
-                file.write(f"DB_PORT={config.DB_PORT}\\n")
-                file.write(f"DB_NAME={config.DB_NAME}\\n")
-                file.write(f"DB_USER={config.DB_USER}\\n")
-                file.write(f"DB_PASSWORD={config.DB_PASSWORD}\\n")
+                file.write("DEMO_MODE=false\n")
+                file.write(f"OLLAMA_URL={config.OLLAMA_URL}\n")
+                file.write(f"OLLAMA_MODEL={config.OLLAMA_MODEL}\n")
+                file.write(f"DB_HOST={config.DB_HOST}\n")
+                file.write(f"DB_PORT={config.DB_PORT}\n")
+                file.write(f"DB_NAME={config.DB_NAME}\n")
+                file.write(f"DB_USER={config.DB_USER}\n")
+                file.write(f"DB_PASSWORD={config.DB_PASSWORD}\n")
 
             config.DEMO_MODE = False
 
@@ -182,7 +303,7 @@ class EngineerAIApp:
             if status.get("connected"):
                 messagebox.showinfo(
                     "Database Connected",
-                    "PostgreSQL Engineering berhasil terhubung.",
+                    "PostgreSQL berhasil terhubung.",
                 )
             else:
                 messagebox.showerror(
@@ -200,34 +321,47 @@ class EngineerAIApp:
     def ask_question(self):
         question = self.question.get("1.0", "end").strip()
         if not question:
-            messagebox.showwarning("Question", "Masukkan pertanyaan.")
             return
 
-        self.answer.configure(state="normal")
-        self.answer.delete("1.0", "end")
-        self.answer.insert("1.0", "Processing...")
-        self.answer.configure(state="disabled")
+        self.question.delete("1.0", "end")
+        self._add_message("user", question)
+        self._add_message("assistant", "Sedang mencari informasi...")
+        pending_row = self.chat_widgets[-1]
 
         def worker():
             try:
                 context = self.db.get_context(question)
                 answer = self.ollama.chat(question, context)
-                result = (
-                    f"{answer}\n\n"
-                    f"[Data source: {context.get('source')}]"
-                )
+                result = answer
+                source = context.get("source", "unknown")
             except Exception as exc:
-                result = f"ERROR: {exc}"
+                result = f"Terjadi kesalahan: {exc}"
+                source = "error"
 
-            self.root.after(0, lambda: self._show_answer(result))
+            self.root.after(
+                0,
+                lambda: self._replace_pending(
+                    pending_row, result, source
+                ),
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_answer(self, text: str):
-        self.answer.configure(state="normal")
-        self.answer.delete("1.0", "end")
-        self.answer.insert("1.0", text)
-        self.answer.configure(state="disabled")
+    def _replace_pending(self, pending_row, answer: str, source: str):
+        pending_row.destroy()
+        if pending_row in self.chat_widgets:
+            self.chat_widgets.remove(pending_row)
+        self._add_message("assistant", answer)
+        self._add_status_message(source)
+
+    def clear_chat(self):
+        for widget in self.chat_widgets:
+            widget.destroy()
+        self.chat_widgets.clear()
+        self._add_message(
+            "assistant",
+            "Percakapan baru dimulai. Silakan tanyakan data Engineering.",
+        )
 
 
 if __name__ == "__main__":
