@@ -65,8 +65,8 @@ class OllamaService:
         data = self._request(
             system=system,
             prompt=prompt,
-            timeout=60,
-            num_predict=256,
+            timeout=30,
+            num_predict=192,
             json_mode=True,
         )
         raw = data.get("message", {}).get("content", "")
@@ -90,7 +90,9 @@ class OllamaService:
             "Do not invent project, employee, customer, drawing, purchase, schedule, "
             "or statistic data. If data is empty, say that the requested data was not found. "
             "For numeric questions, use the exact numbers in the context. "
-            "For lists, preserve names and project numbers from the context. "
+            "For project lists, project_no is the project identifier and project_name is the actual project name. "
+            "If the user asks for nama project, return project_name and optionally project_no; never use project_no as the name. "
+            "For lists, preserve names and project numbers exactly from the context. "
             "Do not mention SQL unless the user asks. "
             "Answer naturally in Indonesian and keep simple answers concise."
         )
@@ -110,8 +112,8 @@ class OllamaService:
         data = self._request(
             system=system,
             prompt=prompt,
-            timeout=90,
-            num_predict=384,
+            timeout=45,
+            num_predict=256,
             json_mode=False,
         )
         answer = data.get("message", {}).get("content")
@@ -138,7 +140,9 @@ class OllamaService:
                 "options": {
                     "temperature": 0.0,
                     "num_predict": num_predict,
+                    "num_ctx": 2048,
                 },
+                "keep_alive": "10m",
             }
             if json_mode:
                 payload["format"] = "json"
