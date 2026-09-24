@@ -67,6 +67,7 @@ class DatabaseService:
                         return self._count_projects_by_years(years, project_type)
                     if years:
                         return self._count_projects_by_years(years)
+                    return self._count_all_projects(project_type)
 
                 project_no = self._extract_project_no(question)
                 if project_no:
@@ -82,7 +83,14 @@ class DatabaseService:
                 ["drawing", "gambar", "dwg", "dxf", "drafter", "drawing total"],
             ):
                 if years or project_type:
-                    return self._drawing_summary(years, project_type)
+                    drawing_context = self._drawing_summary(years, project_type)
+                    if drawing_context.get("data") == [] and planner:
+                        try:
+                            generated_sql = planner(question, self.schema_text())
+                            return self.execute_readonly(generated_sql, question)
+                        except Exception:
+                            pass
+                    return drawing_context
                 return self._table_rows(
                     "drawinglist",
                     preferred_keywords=[
@@ -255,6 +263,33 @@ class DatabaseService:
             ],
             "note": "Live project data from PostgreSQL.",
             "row_count": len(rows),
+        }
+
+    def _count_all_projects(self, project_type: str | None = None):
+        conditions = ["project_no IS NOT NULL"]
+        params: list[Any] = []
+
+        if project_type:
+            conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
+            params.append(project_type)
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM projects WHERE {' AND '.join(conditions)}",
+                    params,
+                )
+                total = cur.fetchone()[0]
+
+        return {
+            "source": "postgresql",
+            "data": {
+                "query": "project_count",
+                "years": [],
+                "project_type": project_type,
+                "total": total,
+            },
+            "note": "Live total project count from PostgreSQL.",
         }
 
     def _count_projects_by_years(
