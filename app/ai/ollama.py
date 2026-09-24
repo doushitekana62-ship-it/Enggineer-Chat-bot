@@ -1,5 +1,6 @@
 from typing import Any
 from datetime import datetime
+import json
 
 import requests
 
@@ -17,7 +18,8 @@ class OllamaService:
             response.raise_for_status()
             models = [m.get("name") for m in response.json().get("models", [])]
             model_available = config.OLLAMA_MODEL in models or any(
-                (m or "").split(":")[0] == config.OLLAMA_MODEL.split(":")[0] for m in models
+                (m or "").split(":")[0] == config.OLLAMA_MODEL.split(":")[0]
+                for m in models
             )
             return {
                 "connected": True,
@@ -35,46 +37,124 @@ class OllamaService:
                 "message": str(exc),
             }
 
+    def plan_sql(self, question: str, schema: str) -> str:
+        if not question.strip():
+            raise ValueError("Question is empty.")
+
+        system = (
+            "You are the SQL planner for an internal Engineering PostgreSQL database. "
+            "Use ONLY the tables and columns in the supplied schema. "
+            "Return JSON only: {\"sql\":\"SELECT ...\"}. "
+            "The SQL MUST be read-only and contain exactly one SELECT or WITH query. "
+            "Never use INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, GRANT, "
+            "REVOKE, COPY, CALL, DO, SET or multiple statements. "
+            "Use LIMIT 200 for row lists. "
+            "Prefer exact columns instead of SELECT *. "
+            "Project type is encoded by the first character of projects.project_no: "
+            "N=New and R=Repair/Revision. "
+            "Project year is characters 2-5 of projects.project_no. "
+            "If the question cannot be answered from the schema, return {\"sql\":\"SELECT 1 WHERE FALSE\"}."
+        )
+
+        prompt = (
+            f"SCHEMA:\n{schema}\n\n"
+            f"QUESTION:\n{question}\n\n"
+            "Return JSON only."
+        )
+
+        data = self._request(
+            system=system,
+            prompt=prompt,
+            timeout=60,
+            num_predict=256,
+            json_mode=True,
+        )
+        raw = data.get("message", {}).get("content", "")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise OllamaError("Ollama SQL planner returned invalid JSON.") from exc
+
+        query = str(parsed.get("sql", "")).strip()
+        if not query:
+            raise OllamaError("Ollama SQL planner returned no SQL.")
+        return query
+
     def chat(self, question: str, context: dict[str, Any]) -> str:
         if not question.strip():
             raise ValueError("Question is empty.")
 
         system = (
             "You are an internal Engineering data assistant. "
-            "Answer only from the supplied context. "
-            "If the context does not contain enough information, say so clearly. "
-            "Never invent project, engineer, customer, drawing, PO, or schedule data. "
-            "Do not claim access to the live company database unless the context says source=postgresql. "
-            "Keep the answer concise and professional. Respond in the user's language."
+            "Answer only from the supplied PostgreSQL context. "
+            "Do not invent project, employee, customer, drawing, purchase, schedule, "
+            "or statistic data. If data is empty, say that the requested data was not found. "
+            "For numeric questions, use the exact numbers in the context. "
+            "For lists, preserve names and project numbers from the context. "
+            "Do not mention SQL unless the user asks. "
+            "Answer naturally in Indonesian and keep simple answers concise."
         )
+
+        # Keep the final prompt small. SQL/result rows are already filtered by the database.
+        compact_data = context.get("data")
+        if isinstance(compact_data, list):
+            compact_data = compact_data[:200]
 
         prompt = (
             f"DATA SOURCE: {context.get('source')}\n"
-            f"CONTEXT: {context.get('data')}\n"
-            f"NOTE: {context.get('note', '')}\n\n"
+            f"DATA: {compact_data}\n"
+            f"NOTE: {context.get('note', '')}\n"
             f"QUESTION: {question}"
         )
 
+        data = self._request(
+            system=system,
+            prompt=prompt,
+            timeout=90,
+            num_predict=384,
+            json_mode=False,
+        )
+        answer = data.get("message", {}).get("content")
+        if not answer:
+            raise OllamaError("Ollama returned an empty response.")
+        return answer.strip()
+
+    def _request(
+        self,
+        system: str,
+        prompt: str,
+        timeout: int,
+        num_predict: int,
+        json_mode: bool,
+    ) -> dict[str, Any]:
         try:
+            payload = {
+                "model": config.OLLAMA_MODEL,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "options": {
+                    "temperature": 0.0,
+                    "num_predict": num_predict,
+                },
+            }
+            if json_mode:
+                payload["format"] = "json"
+
             response = requests.post(
                 f"{config.OLLAMA_URL}/api/chat",
-                json={
-                    "model": config.OLLAMA_MODEL,
-                    "stream": False,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "options": {"temperature": 0.1},
-                },
-                timeout=120,
+                json=payload,
+                timeout=timeout,
             )
             response.raise_for_status()
-            data = response.json()
-            answer = data.get("message", {}).get("content")
-            if not answer:
-                raise OllamaError("Ollama returned an empty response.")
-            return answer.strip()
+            return response.json()
+        except requests.Timeout as exc:
+            raise OllamaError(
+                "Ollama membutuhkan waktu terlalu lama. "
+                "Query database sudah dipisahkan dari proses AI; coba pertanyaan yang lebih spesifik."
+            ) from exc
         except requests.RequestException as exc:
             raise OllamaError(f"Ollama is unavailable: {exc}") from exc
 
