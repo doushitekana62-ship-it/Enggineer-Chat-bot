@@ -22,6 +22,10 @@ BLOCKED_SQL = re.compile(
 
 
 class DatabaseService:
+    def __init__(self):
+        self._metadata_cache: dict[str, Any] | None = None
+        self._metadata_cache_time = 0.0
+
     def status(self) -> dict[str, Any]:
         if config.DEMO_MODE:
             return {
@@ -156,7 +160,15 @@ class DatabaseService:
             if planner:
                 schema = self.schema_text()
                 generated_sql = planner(question, schema)
-                return self.execute_readonly(generated_sql, question)
+                try:
+                    return self.execute_readonly(generated_sql, question)
+                except Exception as sql_error:
+                    return {
+                        "source": "postgresql-planner-error",
+                        "data": [],
+                        "note": f"SQL planner/query failed: {sql_error}",
+                        "generated_sql": generated_sql,
+                    }
 
             return {
                 "source": "postgresql",
@@ -172,11 +184,42 @@ class DatabaseService:
             }
 
     def schema_text(self) -> str:
-        tables = self._public_schema()
-        lines: list[str] = []
-        for table, columns in tables.items():
+        metadata = self._database_metadata()
+        lines = [
+            "DATABASE: PostgreSQL Engineering",
+            "RULES:",
+            "- projects.project_no encodes type in character 1: N=New, R=Repair/Revision.",
+            "- projects.project_no encodes year in characters 2-5.",
+            "- Use declared PK/FK relationships for JOINs.",
+            "- For date questions such as today, use CURRENT_DATE against the relevant date/timestamp column.",
+            "- Never assume a table exists outside this schema.",
+            "",
+            "TABLES AND RELATIONSHIPS:",
+        ]
+
+        for table, info in metadata["tables"].items():
+            columns = ", ".join(
+                f"{col['name']}:{col['type']}" for col in info["columns"]
+            )
             lines.append(f"TABLE {table}:")
-            lines.append("  " + ", ".join(columns))
+            lines.append(f"  COLUMNS: {columns}")
+            if info["primary_key"]:
+                lines.append(f"  PRIMARY KEY: {', '.join(info['primary_key'])}")
+            for fk in info["foreign_keys"]:
+                lines.append(
+                    f"  FOREIGN KEY: {fk['column']} -> "
+                    f"{fk['ref_table']}.{fk['ref_column']}"
+                )
+
+        if metadata["relationships"]:
+            lines.append("")
+            lines.append("RELATIONSHIPS:")
+            for rel in metadata["relationships"]:
+                lines.append(
+                    f"  {rel['table']}.{rel['column']} = "
+                    f"{rel['ref_table']}.{rel['ref_column']}"
+                )
+
         return "\n".join(lines)
 
     def execute_readonly(self, query: str, question: str = "") -> dict[str, Any]:
@@ -210,508 +253,112 @@ class DatabaseService:
             "row_count": len(data),
         }
 
-    def _public_schema(self) -> dict[str, list[str]]:
+    def _database_metadata(self) -> dict[str, Any]:
+        import time
+
+        now = time.time()
+        if self._metadata_cache and now - self._metadata_cache_time < 300:
+            return self._metadata_cache
+
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT table_name, column_name
+                    SELECT table_name, column_name, data_type, udt_name,
+                           is_nullable, ordinal_position
                     FROM information_schema.columns
                     WHERE table_schema = 'public'
                     ORDER BY table_name, ordinal_position
                     """
                 )
-                rows = cur.fetchall()
+                column_rows = cur.fetchall()
 
-        schema: dict[str, list[str]] = {}
-        for table, column in rows:
-            schema.setdefault(table, []).append(column)
-        return schema
-
-    def _project_list(
-        self,
-        years: list[str] | None = None,
-        project_types: list[str] | None = None,
-    ):
-        conditions = []
-        params: list[Any] = []
-
-        if years:
-            if len(years) == 1:
-                conditions.append("SUBSTRING(project_no, 2, 4) = %s")
-                params.append(years[0])
-            else:
-                conditions.append(
-                    "SUBSTRING(project_no, 2, 4) BETWEEN %s AND %s"
-                )
-                params.extend([min(years), max(years)])
-
-        if project_types:
-            if len(project_types) == 1:
-                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
-                params.append(project_types[0])
-            else:
-                conditions.append(
-                    "UPPER(SUBSTRING(project_no, 1, 1)) = ANY(%s)"
-                )
-                params.append(project_types)
-
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
-        with self._connect() as conn:
-            with conn.cursor() as cur:
                 cur.execute(
-                    f"""
-                    SELECT project_no, project_name, customer, status_project,
-                           delivery_date, pic_mechanic, pic_electric
-                    FROM projects
-                    {where_clause}
-                    ORDER BY project_no
-                    LIMIT 200
-                    """,
-                    params,
+                    """
+                    SELECT
+                        tc.table_name,
+                        kcu.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                     AND tc.table_name = kcu.table_name
+                    WHERE tc.table_schema = 'public'
+                      AND tc.constraint_type = 'PRIMARY KEY'
+                    ORDER BY tc.table_name, kcu.ordinal_position
+                    """
                 )
-                rows = cur.fetchall()
+                pk_rows = cur.fetchall()
 
-        return {
-            "source": "postgresql",
-            "data": [
+                cur.execute(
+                    """
+                    SELECT
+                        tc.table_name,
+                        kcu.column_name,
+                        ccu.table_name AS foreign_table_name,
+                        ccu.column_name AS foreign_column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                     AND tc.table_name = kcu.table_name
+                    JOIN information_schema.constraint_column_usage ccu
+                      ON ccu.constraint_name = tc.constraint_name
+                     AND ccu.table_schema = tc.table_schema
+                    WHERE tc.table_schema = 'public'
+                      AND tc.constraint_type = 'FOREIGN KEY'
+                    ORDER BY tc.table_name, kcu.ordinal_position
+                    """
+                )
+                fk_rows = cur.fetchall()
+
+        tables: dict[str, Any] = {}
+        for table, column, data_type, udt_name, nullable, ordinal in column_rows:
+            tables.setdefault(
+                table,
                 {
-                    "project_no": row[0],
-                    "project_name": row[1],
-                    "customer": row[2],
-                    "status_project": row[3],
-                    "delivery_date": row[4].isoformat() if row[4] else None,
-                    "pic_mechanic": row[5],
-                    "pic_electric": row[6],
-                }
-                for row in rows
-            ],
-            "note": "Live project data from PostgreSQL.",
-            "row_count": len(rows),
-        }
-
-    def _count_all_projects(self, project_types: list[str] | None = None):
-        conditions = ["project_no IS NOT NULL"]
-        params: list[Any] = []
-
-        if project_types:
-            if len(project_types) == 1:
-                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
-                params.append(project_types[0])
-            else:
-                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = ANY(%s)")
-                params.append(project_types)
-
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT COUNT(*) FROM projects WHERE {' AND '.join(conditions)}",
-                    params,
-                )
-                total = cur.fetchone()[0]
-
-        return {
-            "source": "postgresql",
-            "data": {
-                "query": "project_count",
-                "years": [],
-                "project_types": project_types or [],
-                "total": total,
-            },
-            "note": "Live total project count from PostgreSQL.",
-        }
-
-    def _count_projects_by_years(
-        self,
-        years: list[str],
-        project_types: list[str] | None = None,
-    ):
-        conditions = ["project_no IS NOT NULL", "LENGTH(project_no) >= 5"]
-        params: list[Any] = []
-
-        if len(years) == 1:
-            conditions.append("SUBSTRING(project_no, 2, 4) = %s")
-            params.append(years[0])
-        else:
-            conditions.append("SUBSTRING(project_no, 2, 4) BETWEEN %s AND %s")
-            params.extend([min(years), max(years)])
-
-        if project_types:
-            if len(project_types) == 1:
-                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
-                params.append(project_types[0])
-            else:
-                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = ANY(%s)")
-                params.append(project_types)
-
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT SUBSTRING(project_no, 2, 4) AS year,
-                           COUNT(*) AS count
-                    FROM projects
-                    WHERE {' AND '.join(conditions)}
-                    GROUP BY 1
-                    ORDER BY 1
-                    """,
-                    params,
-                )
-                by_year = [
-                    {"year": row[0], "count": row[1]}
-                    for row in cur.fetchall()
-                ]
-
-        return {
-            "source": "postgresql",
-            "data": {
-                "query": "project_count",
-                "years": years,
-                "project_types": project_types or [],
-                "by_year": by_year,
-                "total": sum(item["count"] for item in by_year),
-            },
-            "note": "Live database aggregate query.",
-        }
-
-    def _drawing_summary(
-        self,
-        years: list[str] | None,
-        project_types: list[str] | None,
-    ):
-        columns = self._table_columns("drawinglist")
-        project_column = self._find_column(
-            columns,
-            [
-                "project_no", "projectno", "project_number",
-                "project", "no_project", "project_id"
-            ],
-        )
-
-        if not project_column:
-            return {
-                "source": "postgresql",
-                "data": [],
-                "note": "drawinglist tidak memiliki kolom project yang dapat dipetakan otomatis.",
-            }
-
-        conditions = ["p.project_no IS NOT NULL"]
-        params: list[Any] = []
-
-        if years:
-            if len(years) == 1:
-                conditions.append("SUBSTRING(p.project_no, 2, 4) = %s")
-                params.append(years[0])
-            else:
-                conditions.append(
-                    "SUBSTRING(p.project_no, 2, 4) BETWEEN %s AND %s"
-                )
-                params.extend([min(years), max(years)])
-
-        if project_types:
-            if len(project_types) == 1:
-                conditions.append("UPPER(SUBSTRING(p.project_no, 1, 1)) = %s")
-                params.append(project_types[0])
-            else:
-                conditions.append("UPPER(SUBSTRING(p.project_no, 1, 1)) = ANY(%s)")
-                params.append(project_types)
-
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL(
-                        """
-                        SELECT COUNT(*) AS total_drawing,
-                               COUNT(DISTINCT p.project_no) AS total_project
-                        FROM drawinglist d
-                        JOIN projects p
-                          ON UPPER(CAST(d.{project_col} AS text))
-                           = UPPER(p.project_no)
-                        WHERE {conditions}
-                        """
-                    ).format(
-                        project_col=sql.Identifier(project_column),
-                        conditions=sql.SQL(" AND ").join(
-                            sql.SQL(item) for item in conditions
-                        ),
-                    ),
-                    params,
-                )
-                row = cur.fetchone()
-
-        return {
-            "source": "postgresql",
-            "data": {
-                "total_drawing": row[0],
-                "total_project": row[1],
-                "years": years or [],
-                "project_types": project_types or [],
-            },
-            "note": "Total drawing dihitung dari drawinglist dan dipetakan ke projects.",
-        }
-
-    def _count_customers(self):
-        columns = self._table_columns("customer_list")
-        if not columns:
-            raise RuntimeError("Table customer_list tidak ditemukan.")
-
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier("customer_list"))
-                )
-                total = cur.fetchone()[0]
-
-        return {
-            "source": "postgresql",
-            "data": {"query": "customer_count", "total": total},
-            "note": "Total customer dihitung langsung dari customer_list.",
-        }
-
-    def _drawing_count_for_project(self, project_no: str):
-        columns = self._table_columns("drawinglist")
-        project_column = self._find_column(
-            columns,
-            [
-                "project_no", "projectno", "project_number",
-                "no_project", "project", "project_code",
-                "projectid", "project_id", "id_project",
-            ],
-        )
-
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                if project_column:
-                    cur.execute(
-                        sql.SQL(
-                            "SELECT COUNT(*) FROM drawinglist "
-                            "WHERE UPPER(CAST({} AS text)) = UPPER(%s)"
-                        ).format(sql.Identifier(project_column)),
-                        (project_no,),
-                    )
-                    total = cur.fetchone()[0]
-                    return {
-                        "source": "postgresql",
-                        "data": {
-                            "query": "drawing_count_for_project",
-                            "project_no": project_no,
-                            "total_drawing": total,
-                        },
-                        "note": "Jumlah drawing dihitung langsung dari drawinglist.",
-                    }
-
-                # Fallback: search all textual drawinglist columns for the exact project number.
-                cur.execute(
-                    """
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public'
-                      AND table_name = 'drawinglist'
-                      AND data_type IN ('character varying', 'character', 'text')
-                    ORDER BY ordinal_position
-                    """
-                )
-                text_columns = [row[0] for row in cur.fetchall()]
-
-                if text_columns:
-                    predicates = [
-                        sql.SQL("UPPER(CAST({} AS text)) = UPPER(%s)").format(
-                            sql.Identifier(column)
-                        )
-                        for column in text_columns
-                    ]
-                    query = sql.SQL(
-                        "SELECT COUNT(*) FROM drawinglist WHERE "
-                    ) + sql.SQL(" OR ").join(predicates)
-                    cur.execute(query, [project_no] * len(text_columns))
-                    total = cur.fetchone()[0]
-                    return {
-                        "source": "postgresql",
-                        "data": {
-                            "query": "drawing_count_for_project",
-                            "project_no": project_no,
-                            "total_drawing": total,
-                            "search_mode": "all_text_columns",
-                        },
-                        "note": "Jumlah drawing dicari pada kolom teks drawinglist.",
-                    }
-
-        return {
-            "source": "postgresql",
-            "data": [],
-            "note": f"Tidak dapat menemukan kolom penghubung drawinglist untuk {project_no}.",
-        }
-
-    def _project_detail(self, project_no: str):
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT project_no, project_name, customer, machine_capacity,
-                           machine_type, delivery_date, original_project,
-                           reference_project, status_project, pic_mechanic,
-                           pic_electric, furnace_type, heat_source,
-                           processed_material, id_customer, pic_me_id,
-                           pic_elc_id, id, machine_type_id,
-                           machine_capacity_unit_id, project_status_id,
-                           process_material_id, file_3d_path
-                    FROM projects
-                    WHERE UPPER(project_no) = UPPER(%s)
-                    LIMIT 1
-                    """,
-                    (project_no,),
-                )
-                row = cur.fetchone()
-
-        if not row:
-            return {
-                "source": "postgresql",
-                "data": [],
-                "note": f"Project {project_no} tidak ditemukan.",
-            }
-
-        columns = [
-            "project_no", "project_name", "customer", "machine_capacity",
-            "machine_type", "delivery_date", "original_project",
-            "reference_project", "status_project", "pic_mechanic",
-            "pic_electric", "furnace_type", "heat_source",
-            "processed_material", "id_customer", "pic_me_id",
-            "pic_elc_id", "id", "machine_type_id",
-            "machine_capacity_unit_id", "project_status_id",
-            "process_material_id", "file_3d_path"
-        ]
-        data = dict(zip(columns, row))
-        if data.get("delivery_date"):
-            data["delivery_date"] = data["delivery_date"].isoformat()
-
-        return {
-            "source": "postgresql",
-            "data": data,
-            "note": f"Detail project {project_no} dari PostgreSQL.",
-        }
-
-    def _table_rows(
-        self,
-        table: str,
-        preferred_keywords: list[str],
-        limit: int,
-        note: str,
-    ):
-        columns = self._table_columns(table)
-        if not columns:
-            raise RuntimeError(f"Table {table} tidak ditemukan atau tidak memiliki kolom.")
-
-        selected = [
-            column for column in columns
-            if any(keyword in column.lower() for keyword in preferred_keywords)
-        ]
-        if not selected:
-            selected = columns[:8]
-        selected = selected[:12]
-
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                query = sql.SQL("SELECT {} FROM {} LIMIT %s").format(
-                    sql.SQL(", ").join(sql.Identifier(c) for c in selected),
-                    sql.Identifier(table),
-                )
-                cur.execute(query, (limit,))
-                rows = cur.fetchall()
-
-        return {
-            "source": "postgresql",
-            "data": [
+                    "columns": [],
+                    "primary_key": [],
+                    "foreign_keys": [],
+                },
+            )["columns"].append(
                 {
-                    column: self._serialize_value(value)
-                    for column, value in zip(selected, row)
+                    "name": column,
+                    "type": data_type or udt_name,
+                    "nullable": nullable,
+                    "ordinal": ordinal,
                 }
-                for row in rows
-            ],
-            "note": note,
-            "row_count": len(rows),
-        }
+            )
 
-    def _statistics(self):
-        result: dict[str, Any] = {"projects": {}, "tables": {}}
+        for table, column in pk_rows:
+            tables.setdefault(
+                table, {"columns": [], "primary_key": [], "foreign_keys": []}
+            )["primary_key"].append(column)
 
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM projects")
-                result["projects"]["total"] = cur.fetchone()[0]
+        relationships: list[dict[str, str]] = []
+        for table, column, ref_table, ref_column in fk_rows:
+            relation = {
+                "table": table,
+                "column": column,
+                "ref_table": ref_table,
+                "ref_column": ref_column,
+            }
+            tables.setdefault(
+                table, {"columns": [], "primary_key": [], "foreign_keys": []}
+            )["foreign_keys"].append(relation)
+            relationships.append(relation)
 
-                cur.execute(
-                    """
-                    SELECT UPPER(SUBSTRING(project_no, 1, 1)) AS project_type,
-                           COUNT(*)
-                    FROM projects
-                    WHERE project_no IS NOT NULL AND LENGTH(project_no) >= 5
-                    GROUP BY 1 ORDER BY 1
-                    """
-                )
-                result["projects"]["by_type"] = [
-                    {"type": row[0], "count": row[1]} for row in cur.fetchall()
-                ]
-
-                cur.execute(
-                    """
-                    SELECT SUBSTRING(project_no, 2, 4) AS year, COUNT(*)
-                    FROM projects
-                    WHERE project_no ~ '^.[0-9]{4}'
-                    GROUP BY 1 ORDER BY 1 DESC LIMIT 20
-                    """
-                )
-                result["projects"]["by_year"] = [
-                    {"year": row[0], "count": row[1]} for row in cur.fetchall()
-                ]
-
-                cur.execute(
-                    """
-                    SELECT COALESCE(status_project, 'UNKNOWN') AS status, COUNT(*)
-                    FROM projects
-                    GROUP BY 1 ORDER BY 2 DESC
-                    """
-                )
-                result["projects"]["by_status"] = [
-                    {"status": row[0], "count": row[1]} for row in cur.fetchall()
-                ]
-
-                for table in self._public_schema().keys():
-                    try:
-                        cur.execute(
-                            sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table))
-                        )
-                        result["tables"][table] = cur.fetchone()[0]
-                    except Exception:
-                        conn.rollback()
-                        result["tables"][table] = None
-
-        return {
-            "source": "postgresql",
-            "data": result,
-            "note": "Ringkasan statistik yang dihitung langsung dari database Engineering.",
-        }
-
-    def _table_columns(self, table: str) -> list[str]:
-        return self._public_schema().get(table, [])
+        metadata = {"tables": tables, "relationships": relationships}
+        self._metadata_cache = metadata
+        self._metadata_cache_time = now
+        return metadata
 
     def _public_schema(self) -> dict[str, list[str]]:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT table_name, column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public'
-                    ORDER BY table_name, ordinal_position
-                    """
-                )
-                rows = cur.fetchall()
-
-        schema: dict[str, list[str]] = {}
-        for table, column in rows:
-            schema.setdefault(table, []).append(column)
-        return schema
+        metadata = self._database_metadata()
+        return {
+            table: [column["name"] for column in info["columns"]]
+            for table, info in metadata["tables"].items()
+        }
 
     @staticmethod
     def _find_column(columns: list[str], candidates: list[str]) -> str | None:
