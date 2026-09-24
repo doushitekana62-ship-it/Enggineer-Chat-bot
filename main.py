@@ -25,12 +25,13 @@ class EngineerAIApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Engineer AI")
-        self.root.geometry("900x680")
-        self.root.minsize(760, 560)
+        self.root.geometry("980x720")
+        self.root.minsize(800, 600)
 
         self.db = DatabaseService()
         self.ollama = OllamaService()
         self.chat_widgets = []
+        self.busy = False
 
         self.db_vars = {
             "host": tk.StringVar(value=config.DB_HOST),
@@ -56,8 +57,8 @@ class EngineerAIApp:
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
-        settings = ttk.Frame(notebook, padding=15)
         chat = ttk.Frame(notebook, padding=12)
+        settings = ttk.Frame(notebook, padding=15)
         notebook.add(chat, text="Chat")
         notebook.add(settings, text="Database Settings")
 
@@ -88,6 +89,7 @@ class EngineerAIApp:
             chat_box,
             highlightthickness=0,
             borderwidth=0,
+            bg="white",
         )
         scrollbar = ttk.Scrollbar(
             chat_box,
@@ -99,7 +101,7 @@ class EngineerAIApp:
         scrollbar.pack(side="right", fill="y")
         self.chat_canvas.pack(side="left", fill="both", expand=True)
 
-        self.chat_frame = tk.Frame(self.chat_canvas)
+        self.chat_frame = tk.Frame(self.chat_canvas, bg="white")
         self.chat_window = self.chat_canvas.create_window(
             (0, 0),
             window=self.chat_frame,
@@ -120,6 +122,10 @@ class EngineerAIApp:
             ),
         )
 
+        self.chat_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.chat_canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.chat_canvas.bind_all("<Button-5>", self._on_mousewheel)
+
         self._add_message(
             "assistant",
             "Halo. Saya Engineer AI. Silakan tanyakan data Engineering.",
@@ -135,19 +141,26 @@ class EngineerAIApp:
             font=("Segoe UI", 10),
         )
         self.question.pack(side="left", fill="both", expand=True, padx=(0, 8))
-        self.question.bind("<Control-Return>", lambda event: self.ask_question())
+        self.question.bind("<Return>", self._on_enter)
 
-        ttk.Button(
+        self.send_button = ttk.Button(
             composer,
             text="Kirim",
             command=self.ask_question,
             width=10,
-        ).pack(side="right", fill="y")
+        )
+        self.send_button.pack(side="right", fill="y")
+
+        ttk.Button(
+            parent,
+            text="Percakapan Baru",
+            command=self.clear_chat,
+        ).pack(anchor="w", pady=(6, 0))
 
     def _build_settings(self, parent):
         ttk.Label(
             parent,
-            text="Engineering Database Connection",
+            text="Database Connection",
             font=("Segoe UI", 14, "bold"),
         ).pack(anchor="w")
 
@@ -198,8 +211,33 @@ class EngineerAIApp:
         self.status_text.pack(fill="both", expand=True, pady=(5, 0))
         self.status_text.configure(state="disabled")
 
+    def _on_enter(self, event):
+        # Enter sends. Shift+Enter keeps a newline.
+        if event.state & 0x0001:
+            return None
+        self.ask_question()
+        return "break"
+
+    def _on_mousewheel(self, event):
+        try:
+            canvas_top = self.chat_canvas.winfo_rooty()
+            canvas_bottom = canvas_top + self.chat_canvas.winfo_height()
+            if not (canvas_top <= event.y_root <= canvas_bottom):
+                return
+
+            if getattr(event, "num", None) == 4:
+                delta = -3
+            elif getattr(event, "num", None) == 5:
+                delta = 3
+            else:
+                delta = -3 if event.delta > 0 else 3
+
+            self.chat_canvas.yview_scroll(delta, "units")
+        except tk.TclError:
+            pass
+
     def _add_message(self, role: str, text: str):
-        row = tk.Frame(self.chat_frame)
+        row = tk.Frame(self.chat_frame, bg="white")
         row.pack(fill="x", padx=8, pady=5)
 
         if role == "user":
@@ -208,39 +246,38 @@ class EngineerAIApp:
                 text=text,
                 justify="left",
                 anchor="w",
-                wraplength=620,
-                padx=12,
-                pady=8,
+                wraplength=680,
+                padx=14,
+                pady=10,
                 bg="#E8F0FE",
                 fg="#202124",
                 font=("Segoe UI", 10),
             )
-            bubble.pack(side="right", padx=(100, 0))
+            bubble.pack(side="right", padx=(150, 0))
         else:
             bubble = tk.Label(
                 row,
                 text=text,
                 justify="left",
                 anchor="w",
-                wraplength=620,
-                padx=12,
-                pady=8,
+                wraplength=680,
+                padx=14,
+                pady=10,
                 bg="#F1F3F4",
                 fg="#202124",
                 font=("Segoe UI", 10),
             )
-            bubble.pack(side="left", padx=(0, 100))
+            bubble.pack(side="left", padx=(0, 150))
 
         self.chat_widgets.append(row)
-        self.root.after_idle(
-            lambda: self.chat_canvas.yview_moveto(1.0)
-        )
+        self.root.after_idle(lambda: self.chat_canvas.yview_moveto(1.0))
 
     def _add_status_message(self, source: str):
         label = tk.Label(
             self.chat_frame,
             text=f"Sumber data: {source}",
             anchor="w",
+            bg="white",
             fg="#777777",
             font=("Segoe UI", 8),
         )
@@ -276,7 +313,6 @@ class EngineerAIApp:
             f"  Model     : {ollama.get('model')}\n"
             f"  Available : {ollama.get('model_available')}\n"
         )
-
         self._write_status(text)
 
     def save_and_test(self):
@@ -319,18 +355,29 @@ class EngineerAIApp:
             messagebox.showerror("Error", str(exc))
 
     def ask_question(self):
+        if self.busy:
+            return
+
         question = self.question.get("1.0", "end").strip()
         if not question:
             return
 
         self.question.delete("1.0", "end")
         self._add_message("user", question)
-        self._add_message("assistant", "Sedang mencari informasi...")
+        self._add_message("assistant", "Sedang memproses...")
         pending_row = self.chat_widgets[-1]
+
+        self.busy = True
+        self.send_button.configure(state="disabled")
 
         def worker():
             try:
-                context = self.db.get_context(question)
+                # The DB engine handles deterministic queries first.
+                # Unknown questions use Ollama as a read-only SQL planner.
+                context = self.db.get_context(
+                    question,
+                    planner=self.ollama.plan_sql,
+                )
                 answer = self.ollama.chat(question, context)
                 result = answer
                 source = context.get("source", "unknown")
@@ -341,27 +388,41 @@ class EngineerAIApp:
             self.root.after(
                 0,
                 lambda: self._replace_pending(
-                    pending_row, result, source
+                    pending_row,
+                    result,
+                    source,
                 ),
             )
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _replace_pending(self, pending_row, answer: str, source: str):
-        pending_row.destroy()
+        try:
+            pending_row.destroy()
+        except tk.TclError:
+            pass
+
         if pending_row in self.chat_widgets:
             self.chat_widgets.remove(pending_row)
+
         self._add_message("assistant", answer)
         self._add_status_message(source)
+        self.busy = False
+        self.send_button.configure(state="normal")
+        self.question.focus_set()
 
     def clear_chat(self):
         for widget in self.chat_widgets:
-            widget.destroy()
+            try:
+                widget.destroy()
+            except tk.TclError:
+                pass
         self.chat_widgets.clear()
         self._add_message(
             "assistant",
             "Percakapan baru dimulai. Silakan tanyakan data Engineering.",
         )
+        self.question.focus_set()
 
 
 if __name__ == "__main__":
