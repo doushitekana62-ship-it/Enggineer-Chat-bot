@@ -1,7 +1,20 @@
 import os
+from pathlib import Path
+import sys
+
 from dotenv import load_dotenv
 
-load_dotenv()
+
+def _env_path() -> Path:
+    base = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parents[1]
+    )
+    return base / ".env"
+
+
+load_dotenv(_env_path())
 
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
