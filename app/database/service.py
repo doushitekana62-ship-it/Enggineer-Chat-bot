@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Callable
 import re
 
 import psycopg2
@@ -13,13 +13,12 @@ DEMO_PROJECTS = [
     {"project_no": "N2025004", "project_name": "Old New Project", "status": "COMPLETED", "customer": "Demo Customer", "engineer": "Engineer D"},
 ]
 
-ALLOWED_TABLES = {
-    "projects",
-    "member_list",
-    "customer_list",
-    "drawinglist",
-    "project_status",
-}
+# The chatbot can inspect every public table, but SQL execution remains read-only.
+BLOCKED_SQL = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|"
+    r"VACUUM|ANALYZE|CALL|DO|COPY|EXECUTE|SET)\b",
+    flags=re.IGNORECASE,
+)
 
 
 class DatabaseService:
@@ -48,39 +47,66 @@ class DatabaseService:
                 "message": f"Database connection failed: {exc}",
             }
 
-    def get_context(self, question: str) -> dict[str, Any]:
+    def get_context(
+        self,
+        question: str,
+        planner: Callable[[str, str], str] | None = None,
+    ) -> dict[str, Any]:
         if config.DEMO_MODE:
             return self._demo_context(question)
 
         q = question.lower().strip()
-        year = self._extract_year(question)
+        years = self._extract_years(question)
         project_type = self._extract_project_type(question)
 
         try:
-            # Project-specific questions
+            # Project queries are handled directly so simple questions do not wait for an LLM.
             if self._looks_like_project_question(q):
-                if year and project_type and self._looks_like_count_question(q):
-                    return self._count_projects_by_year_and_type(year, project_type)
+                if self._looks_like_count_question(q):
+                    if years and project_type:
+                        return self._count_projects_by_years(years, project_type)
+                    if years:
+                        return self._count_projects_by_years(years)
 
                 project_no = self._extract_project_no(question)
                 if project_no:
                     return self._project_detail(project_no)
 
-                return self._project_list(year=year, project_type=project_type)
+                return self._project_list(
+                    years=years,
+                    project_type=project_type,
+                )
 
-            # Employee / member questions
-            if self._contains_any(q, ["karyawan", "pegawai", "employee", "member", "engineer", "engineer list"]):
+            if self._contains_any(
+                q,
+                ["drawing", "gambar", "dwg", "dxf", "drafter", "drawing total"],
+            ):
+                if years or project_type:
+                    return self._drawing_summary(years, project_type)
+                return self._table_rows(
+                    "drawinglist",
+                    preferred_keywords=[
+                        "project", "drawing", "dwg", "dxf", "name", "title",
+                        "drafter", "status", "progress", "path"
+                    ],
+                    limit=100,
+                    note="Data drawing dari drawinglist.",
+                )
+
+            if self._contains_any(
+                q,
+                ["karyawan", "pegawai", "employee", "member", "engineer", "staff"],
+            ):
                 return self._table_rows(
                     "member_list",
                     preferred_keywords=[
                         "name", "nama", "member", "employee", "nik",
                         "position", "jabatan", "department", "dept", "role"
                     ],
-                    limit=100,
+                    limit=200,
                     note="Data anggota/karyawan Engineering dari member_list.",
                 )
 
-            # Customer questions
             if self._contains_any(q, ["customer", "pelanggan", "client", "klien"]):
                 return self._table_rows(
                     "customer_list",
@@ -88,28 +114,27 @@ class DatabaseService:
                         "name", "nama", "customer", "company", "company_name",
                         "address", "alamat", "id"
                     ],
-                    limit=100,
+                    limit=200,
                     note="Data customer dari customer_list.",
                 )
 
-            # Drawing questions
-            if self._contains_any(q, ["drawing", "gambar", "dwg", "dxf", "drafter"]):
-                return self._table_rows(
-                    "drawinglist",
-                    preferred_keywords=[
-                        "project", "drawing", "dwg", "dxf", "name", "nama",
-                        "drafter", "status", "progress", "path"
-                    ],
-                    limit=100,
-                    note="Data drawing dari drawinglist.",
-                )
-
-            # General statistics / dashboard-style questions
-            if self._contains_any(q, ["statistik", "statistics", "statistic", "ringkasan", "summary", "dashboard", "rekap"]):
+            if self._contains_any(
+                q,
+                ["statistik", "statistics", "statistic", "ringkasan", "summary", "dashboard", "rekap"],
+            ):
                 return self._statistics()
 
-            # Generic project listing as a useful fallback
-            return self._project_list(year=year, project_type=project_type)
+            # General questions use the real database schema as the LLM's tool surface.
+            if planner:
+                schema = self.schema_text()
+                generated_sql = planner(question, schema)
+                return self.execute_readonly(generated_sql, question)
+
+            return {
+                "source": "postgresql",
+                "data": [],
+                "note": "Pertanyaan memerlukan query dinamis. Schema database tersedia, tetapi SQL planner belum aktif.",
+            }
 
         except Exception as exc:
             return {
@@ -118,13 +143,80 @@ class DatabaseService:
                 "note": f"Database query failed: {exc}",
             }
 
-    def _project_list(self, year: str | None = None, project_type: str | None = None):
+    def schema_text(self) -> str:
+        tables = self._public_schema()
+        lines: list[str] = []
+        for table, columns in tables.items():
+            lines.append(f"TABLE {table}:")
+            lines.append("  " + ", ".join(columns))
+        return "\n".join(lines)
+
+    def execute_readonly(self, query: str, question: str = "") -> dict[str, Any]:
+        cleaned = query.strip().rstrip(";").strip()
+        if not cleaned:
+            raise ValueError("SQL planner returned an empty query.")
+        if ";" in cleaned:
+            raise ValueError("Only one read-only SQL statement is allowed.")
+        if BLOCKED_SQL.search(cleaned):
+            raise ValueError("SQL planner produced a non-read-only statement.")
+        if not re.match(r"^(SELECT|WITH)\b", cleaned, flags=re.IGNORECASE):
+            raise ValueError("Only SELECT/WITH queries are allowed.")
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                cur.execute(cleaned)
+                columns = [desc[0] for desc in cur.description] if cur.description else []
+                rows = cur.fetchmany(200)
+
+        data = [
+            {column: self._serialize_value(value) for column, value in zip(columns, row)}
+            for row in rows
+        ]
+
+        return {
+            "source": "postgresql",
+            "data": data,
+            "note": f"Read-only SQL generated for: {question}" if question else "Read-only SQL query.",
+            "query": cleaned,
+            "row_count": len(data),
+        }
+
+    def _public_schema(self) -> dict[str, list[str]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT table_name, column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                    ORDER BY table_name, ordinal_position
+                    """
+                )
+                rows = cur.fetchall()
+
+        schema: dict[str, list[str]] = {}
+        for table, column in rows:
+            schema.setdefault(table, []).append(column)
+        return schema
+
+    def _project_list(
+        self,
+        years: list[str] | None = None,
+        project_type: str | None = None,
+    ):
         conditions = []
         params: list[Any] = []
 
-        if year:
-            conditions.append("SUBSTRING(project_no, 2, 4) = %s")
-            params.append(year)
+        if years:
+            if len(years) == 1:
+                conditions.append("SUBSTRING(project_no, 2, 4) = %s")
+                params.append(years[0])
+            else:
+                conditions.append(
+                    "SUBSTRING(project_no, 2, 4) BETWEEN %s AND %s"
+                )
+                params.extend([min(years), max(years)])
 
         if project_type:
             conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
@@ -141,7 +233,7 @@ class DatabaseService:
                     FROM projects
                     {where_clause}
                     ORDER BY project_no
-                    LIMIT 100
+                    LIMIT 200
                     """,
                     params,
                 )
@@ -162,6 +254,128 @@ class DatabaseService:
                 for row in rows
             ],
             "note": "Live project data from PostgreSQL.",
+            "row_count": len(rows),
+        }
+
+    def _count_projects_by_years(
+        self,
+        years: list[str],
+        project_type: str | None = None,
+    ):
+        conditions = ["project_no IS NOT NULL", "LENGTH(project_no) >= 5"]
+        params: list[Any] = []
+
+        if len(years) == 1:
+            conditions.append("SUBSTRING(project_no, 2, 4) = %s")
+            params.append(years[0])
+        else:
+            conditions.append("SUBSTRING(project_no, 2, 4) BETWEEN %s AND %s")
+            params.extend([min(years), max(years)])
+
+        if project_type:
+            conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
+            params.append(project_type)
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT SUBSTRING(project_no, 2, 4) AS year,
+                           COUNT(*) AS count
+                    FROM projects
+                    WHERE {' AND '.join(conditions)}
+                    GROUP BY 1
+                    ORDER BY 1
+                    """,
+                    params,
+                )
+                by_year = [
+                    {"year": row[0], "count": row[1]}
+                    for row in cur.fetchall()
+                ]
+
+        return {
+            "source": "postgresql",
+            "data": {
+                "query": "project_count",
+                "years": years,
+                "project_type": project_type,
+                "by_year": by_year,
+                "total": sum(item["count"] for item in by_year),
+            },
+            "note": "Live database aggregate query.",
+        }
+
+    def _drawing_summary(
+        self,
+        years: list[str] | None,
+        project_type: str | None,
+    ):
+        columns = self._table_columns("drawinglist")
+        project_column = self._find_column(
+            columns,
+            [
+                "project_no", "projectno", "project_number",
+                "project", "no_project", "project_id"
+            ],
+        )
+
+        if not project_column:
+            return {
+                "source": "postgresql",
+                "data": [],
+                "note": "drawinglist tidak memiliki kolom project yang dapat dipetakan otomatis.",
+            }
+
+        conditions = ["p.project_no IS NOT NULL"]
+        params: list[Any] = []
+
+        if years:
+            if len(years) == 1:
+                conditions.append("SUBSTRING(p.project_no, 2, 4) = %s")
+                params.append(years[0])
+            else:
+                conditions.append(
+                    "SUBSTRING(p.project_no, 2, 4) BETWEEN %s AND %s"
+                )
+                params.extend([min(years), max(years)])
+
+        if project_type:
+            conditions.append("UPPER(SUBSTRING(p.project_no, 1, 1)) = %s")
+            params.append(project_type)
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL(
+                        """
+                        SELECT COUNT(*) AS total_drawing,
+                               COUNT(DISTINCT p.project_no) AS total_project
+                        FROM drawinglist d
+                        JOIN projects p
+                          ON UPPER(CAST(d.{project_col} AS text))
+                           = UPPER(p.project_no)
+                        WHERE {conditions}
+                        """
+                    ).format(
+                        project_col=sql.Identifier(project_column),
+                        conditions=sql.SQL(" AND ").join(
+                            sql.SQL(item) for item in conditions
+                        ),
+                    ),
+                    params,
+                )
+                row = cur.fetchone()
+
+        return {
+            "source": "postgresql",
+            "data": {
+                "total_drawing": row[0],
+                "total_project": row[1],
+                "years": years or [],
+                "project_type": project_type,
+            },
+            "note": "Total drawing dihitung dari drawinglist dan dipetakan ke projects.",
         }
 
     def _project_detail(self, project_no: str):
@@ -202,7 +416,6 @@ class DatabaseService:
             "machine_capacity_unit_id", "project_status_id",
             "process_material_id", "file_3d_path"
         ]
-
         data = dict(zip(columns, row))
         if data.get("delivery_date"):
             data["delivery_date"] = data["delivery_date"].isoformat()
@@ -213,31 +426,6 @@ class DatabaseService:
             "note": f"Detail project {project_no} dari PostgreSQL.",
         }
 
-    def _count_projects_by_year_and_type(self, year: str, project_type: str):
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM projects
-                    WHERE SUBSTRING(project_no, 2, 4) = %s
-                      AND UPPER(SUBSTRING(project_no, 1, 1)) = %s
-                    """,
-                    (year, project_type),
-                )
-                count = cur.fetchone()[0]
-
-        return {
-            "source": "postgresql",
-            "data": {
-                "query": "project_count",
-                "year": year,
-                "project_type": project_type,
-                "count": count,
-            },
-            "note": "Live database aggregate query.",
-        }
-
     def _table_rows(
         self,
         table: str,
@@ -245,9 +433,6 @@ class DatabaseService:
         limit: int,
         note: str,
     ):
-        if table not in ALLOWED_TABLES:
-            raise ValueError("Table is not allowed.")
-
         columns = self._table_columns(table)
         if not columns:
             raise RuntimeError(f"Table {table} tidak ditemukan atau tidak memiliki kolom.")
@@ -256,11 +441,8 @@ class DatabaseService:
             column for column in columns
             if any(keyword in column.lower() for keyword in preferred_keywords)
         ]
-
-        # If keyword matching is too narrow, use the first few non-sensitive-looking columns.
         if not selected:
             selected = columns[:8]
-
         selected = selected[:12]
 
         with self._connect() as conn:
@@ -272,25 +454,21 @@ class DatabaseService:
                 cur.execute(query, (limit,))
                 rows = cur.fetchall()
 
-        data = [
-            {
-                column: self._serialize_value(value)
-                for column, value in zip(selected, row)
-            }
-            for row in rows
-        ]
-
         return {
             "source": "postgresql",
-            "data": data,
+            "data": [
+                {
+                    column: self._serialize_value(value)
+                    for column, value in zip(selected, row)
+                }
+                for row in rows
+            ],
             "note": note,
+            "row_count": len(rows),
         }
 
     def _statistics(self):
-        result: dict[str, Any] = {
-            "projects": {},
-            "tables": {},
-        }
+        result: dict[str, Any] = {"projects": {}, "tables": {}}
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -303,8 +481,7 @@ class DatabaseService:
                            COUNT(*)
                     FROM projects
                     WHERE project_no IS NOT NULL AND LENGTH(project_no) >= 5
-                    GROUP BY 1
-                    ORDER BY 1
+                    GROUP BY 1 ORDER BY 1
                     """
                 )
                 result["projects"]["by_type"] = [
@@ -313,13 +490,10 @@ class DatabaseService:
 
                 cur.execute(
                     """
-                    SELECT SUBSTRING(project_no, 2, 4) AS year,
-                           COUNT(*)
+                    SELECT SUBSTRING(project_no, 2, 4) AS year, COUNT(*)
                     FROM projects
                     WHERE project_no ~ '^.[0-9]{4}'
-                    GROUP BY 1
-                    ORDER BY 1 DESC
-                    LIMIT 20
+                    GROUP BY 1 ORDER BY 1 DESC LIMIT 20
                     """
                 )
                 result["projects"]["by_year"] = [
@@ -328,18 +502,16 @@ class DatabaseService:
 
                 cur.execute(
                     """
-                    SELECT COALESCE(status_project, 'UNKNOWN') AS status,
-                           COUNT(*)
+                    SELECT COALESCE(status_project, 'UNKNOWN') AS status, COUNT(*)
                     FROM projects
-                    GROUP BY 1
-                    ORDER BY 2 DESC
+                    GROUP BY 1 ORDER BY 2 DESC
                     """
                 )
                 result["projects"]["by_status"] = [
                     {"status": row[0], "count": row[1]} for row in cur.fetchall()
                 ]
 
-                for table in ["member_list", "customer_list", "drawinglist", "project_status"]:
+                for table in self._public_schema().keys():
                     try:
                         cur.execute(
                             sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table))
@@ -356,22 +528,33 @@ class DatabaseService:
         }
 
     def _table_columns(self, table: str) -> list[str]:
-        if table not in ALLOWED_TABLES:
-            return []
+        return self._public_schema().get(table, [])
 
+    def _public_schema(self) -> dict[str, list[str]]:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT column_name
+                    SELECT table_name, column_name
                     FROM information_schema.columns
                     WHERE table_schema = 'public'
-                      AND table_name = %s
-                    ORDER BY ordinal_position
-                    """,
-                    (table,),
+                    ORDER BY table_name, ordinal_position
+                    """
                 )
-                return [row[0] for row in cur.fetchall()]
+                rows = cur.fetchall()
+
+        schema: dict[str, list[str]] = {}
+        for table, column in rows:
+            schema.setdefault(table, []).append(column)
+        return schema
+
+    @staticmethod
+    def _find_column(columns: list[str], candidates: list[str]) -> str | None:
+        lowered = {c.lower(): c for c in columns}
+        for candidate in candidates:
+            if candidate.lower() in lowered:
+                return lowered[candidate.lower()]
+        return None
 
     @staticmethod
     def _serialize_value(value: Any):
@@ -394,7 +577,7 @@ class DatabaseService:
     def _looks_like_count_question(question: str) -> bool:
         return any(
             word in question
-            for word in ["berapa", "jumlah", "count", "total", "ada berapa"]
+            for word in ["berapa", "jumlah", "count", "total", "ada berapa", "banyak"]
         )
 
     @staticmethod
@@ -403,9 +586,8 @@ class DatabaseService:
         return match.group(0).upper() if match else None
 
     @staticmethod
-    def _extract_year(question: str) -> str | None:
-        match = re.search(r"\b(20\d{2})\b", question)
-        return match.group(1) if match else None
+    def _extract_years(question: str) -> list[str]:
+        return sorted(set(re.findall(r"\b(20\d{2})\b", question)))
 
     @staticmethod
     def _extract_project_type(question: str) -> str | None:
@@ -419,38 +601,36 @@ class DatabaseService:
 
         if re.search(r"\bnew\b", question, flags=re.IGNORECASE):
             return "N"
-
         if re.search(r"\brepair\b|\brevisi\b|\brevision\b", question, flags=re.IGNORECASE):
             return "R"
-
         return None
 
     def _demo_context(self, question: str):
-        year = self._extract_year(question)
+        years = self._extract_years(question)
         project_type = self._extract_project_type(question)
 
-        if year and project_type:
+        if years and project_type:
             count = sum(
                 1
                 for project in DEMO_PROJECTS
                 if project["project_no"][0].upper() == project_type
-                and project["project_no"][1:5] == year
+                and project["project_no"][1:5] in years
             )
             return {
                 "source": "demo",
                 "data": {
                     "query": "project_count",
-                    "year": year,
+                    "years": years,
                     "project_type": project_type,
                     "count": count,
                 },
-                "note": "DEMO ONLY. Count is calculated from fictional prototype data.",
+                "note": "DEMO ONLY.",
             }
 
         return {
             "source": "demo",
             "data": DEMO_PROJECTS,
-            "note": "DEMO ONLY. Data is fictional and must not be presented as live company data.",
+            "note": "DEMO ONLY.",
         }
 
     def _connect(self):
