@@ -938,24 +938,6 @@ class DatabaseService:
     def _table_columns(self, table: str) -> list[str]:
         return self._public_schema().get(table, [])
 
-    def _public_schema(self) -> dict[str, list[str]]:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT table_name, column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public'
-                    ORDER BY table_name, ordinal_position
-                    """
-                )
-                rows = cur.fetchall()
-
-        schema: dict[str, list[str]] = {}
-        for table, column in rows:
-            schema.setdefault(table, []).append(column)
-        return schema
-
     @staticmethod
     def _find_column(columns: list[str], candidates: list[str]) -> str | None:
         lowered = {c.lower(): c for c in columns}
