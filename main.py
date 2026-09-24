@@ -378,8 +378,14 @@ class EngineerAIApp:
                     question,
                     planner=self.ollama.plan_sql,
                 )
-                answer = self.ollama.chat(question, context)
-                result = answer
+                if context.get("source", "").endswith("error"):
+                    result = context.get(
+                        "note",
+                        "Terjadi kesalahan saat membaca PostgreSQL.",
+                    )
+                else:
+                    answer = self.ollama.chat(question, context)
+                    result = answer
                 source = context.get("source", "unknown")
             except Exception as exc:
                 result = f"Terjadi kesalahan: {exc}"
