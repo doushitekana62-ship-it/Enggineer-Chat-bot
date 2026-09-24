@@ -57,33 +57,25 @@ class DatabaseService:
 
         q = question.lower().strip()
         years = self._extract_years(question)
-        project_type = self._extract_project_type(question)
+        project_types = self._extract_project_types(question)
+        project_type = project_types[0] if len(project_types) == 1 else None
+        project_no = self._extract_project_no(question)
 
         try:
-            # Project queries are handled directly so simple questions do not wait for an LLM.
-            if self._looks_like_project_question(q):
-                if self._looks_like_count_question(q):
-                    if years and project_type:
-                        return self._count_projects_by_years(years, project_type)
-                    if years:
-                        return self._count_projects_by_years(years)
-                    return self._count_all_projects(project_type)
+            # Resolve a specific project number before generic project/count routing.
+            if project_no:
+                if self._contains_any(q, ["drawing", "gambar", "dwg", "dxf"]):
+                    return self._drawing_count_for_project(project_no)
+                return self._project_detail(project_no)
 
-                project_no = self._extract_project_no(question)
-                if project_no:
-                    return self._project_detail(project_no)
-
-                return self._project_list(
-                    years=years,
-                    project_type=project_type,
-                )
-
+            # Drawing intent must be checked before "project" because drawing questions
+            # commonly contain the word project.
             if self._contains_any(
                 q,
                 ["drawing", "gambar", "dwg", "dxf", "drafter", "drawing total"],
             ):
-                if years or project_type:
-                    drawing_context = self._drawing_summary(years, project_type)
+                if years or project_types:
+                    drawing_context = self._drawing_summary(years, project_types)
                     if drawing_context.get("data") == [] and planner:
                         try:
                             generated_sql = planner(question, self.schema_text())
@@ -101,6 +93,30 @@ class DatabaseService:
                     note="Data drawing dari drawinglist.",
                 )
 
+            if self._looks_like_project_question(q):
+                if self._looks_like_count_question(q):
+                    if years:
+                        return self._count_projects_by_years(years, project_types)
+                    return self._count_all_projects(project_types)
+
+                return self._project_list(
+                    years=years,
+                    project_types=project_types,
+                )
+
+            # Only plain employee/member listing uses the member_list shortcut.
+            # Activity/date questions must go through the SQL planner so the model
+            # can locate the actual activity/history table.
+            activity_words = [
+                "activity", "aktivitas", "aktifitas", "kegiatan",
+                "hari ini", "today", "kemarin", "yesterday",
+                "login", "logout", "log", "history", "riwayat",
+            ]
+            if self._contains_any(q, activity_words):
+                if planner:
+                    generated_sql = planner(question, self.schema_text())
+                    return self.execute_readonly(generated_sql, question)
+
             if self._contains_any(
                 q,
                 ["karyawan", "pegawai", "employee", "member", "engineer", "staff"],
@@ -116,6 +132,8 @@ class DatabaseService:
                 )
 
             if self._contains_any(q, ["customer", "pelanggan", "client", "klien"]):
+                if self._looks_like_count_question(q):
+                    return self._count_customers()
                 return self._table_rows(
                     "customer_list",
                     preferred_keywords=[
@@ -130,9 +148,11 @@ class DatabaseService:
                 q,
                 ["statistik", "statistics", "statistic", "ringkasan", "summary", "dashboard", "rekap"],
             ):
+                if planner and self._contains_any(q, ["drawing", "member", "drafter", "pic", "activity"]):
+                    generated_sql = planner(question, self.schema_text())
+                    return self.execute_readonly(generated_sql, question)
                 return self._statistics()
 
-            # General questions use the real database schema as the LLM's tool surface.
             if planner:
                 schema = self.schema_text()
                 generated_sql = planner(question, schema)
@@ -211,7 +231,7 @@ class DatabaseService:
     def _project_list(
         self,
         years: list[str] | None = None,
-        project_type: str | None = None,
+        project_types: list[str] | None = None,
     ):
         conditions = []
         params: list[Any] = []
@@ -226,9 +246,15 @@ class DatabaseService:
                 )
                 params.extend([min(years), max(years)])
 
-        if project_type:
-            conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
-            params.append(project_type)
+        if project_types:
+            if len(project_types) == 1:
+                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
+                params.append(project_types[0])
+            else:
+                conditions.append(
+                    "UPPER(SUBSTRING(project_no, 1, 1)) = ANY(%s)"
+                )
+                params.append(project_types)
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -265,13 +291,17 @@ class DatabaseService:
             "row_count": len(rows),
         }
 
-    def _count_all_projects(self, project_type: str | None = None):
+    def _count_all_projects(self, project_types: list[str] | None = None):
         conditions = ["project_no IS NOT NULL"]
         params: list[Any] = []
 
-        if project_type:
-            conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
-            params.append(project_type)
+        if project_types:
+            if len(project_types) == 1:
+                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
+                params.append(project_types[0])
+            else:
+                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = ANY(%s)")
+                params.append(project_types)
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -286,7 +316,7 @@ class DatabaseService:
             "data": {
                 "query": "project_count",
                 "years": [],
-                "project_type": project_type,
+                "project_types": project_types or [],
                 "total": total,
             },
             "note": "Live total project count from PostgreSQL.",
@@ -295,7 +325,7 @@ class DatabaseService:
     def _count_projects_by_years(
         self,
         years: list[str],
-        project_type: str | None = None,
+        project_types: list[str] | None = None,
     ):
         conditions = ["project_no IS NOT NULL", "LENGTH(project_no) >= 5"]
         params: list[Any] = []
@@ -307,9 +337,13 @@ class DatabaseService:
             conditions.append("SUBSTRING(project_no, 2, 4) BETWEEN %s AND %s")
             params.extend([min(years), max(years)])
 
-        if project_type:
-            conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
-            params.append(project_type)
+        if project_types:
+            if len(project_types) == 1:
+                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = %s")
+                params.append(project_types[0])
+            else:
+                conditions.append("UPPER(SUBSTRING(project_no, 1, 1)) = ANY(%s)")
+                params.append(project_types)
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -334,7 +368,7 @@ class DatabaseService:
             "data": {
                 "query": "project_count",
                 "years": years,
-                "project_type": project_type,
+                "project_types": project_types or [],
                 "by_year": by_year,
                 "total": sum(item["count"] for item in by_year),
             },
@@ -344,7 +378,7 @@ class DatabaseService:
     def _drawing_summary(
         self,
         years: list[str] | None,
-        project_type: str | None,
+        project_types: list[str] | None,
     ):
         columns = self._table_columns("drawinglist")
         project_column = self._find_column(
@@ -375,9 +409,13 @@ class DatabaseService:
                 )
                 params.extend([min(years), max(years)])
 
-        if project_type:
-            conditions.append("UPPER(SUBSTRING(p.project_no, 1, 1)) = %s")
-            params.append(project_type)
+        if project_types:
+            if len(project_types) == 1:
+                conditions.append("UPPER(SUBSTRING(p.project_no, 1, 1)) = %s")
+                params.append(project_types[0])
+            else:
+                conditions.append("UPPER(SUBSTRING(p.project_no, 1, 1)) = ANY(%s)")
+                params.append(project_types)
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -408,9 +446,101 @@ class DatabaseService:
                 "total_drawing": row[0],
                 "total_project": row[1],
                 "years": years or [],
-                "project_type": project_type,
+                "project_types": project_types or [],
             },
             "note": "Total drawing dihitung dari drawinglist dan dipetakan ke projects.",
+        }
+
+    def _count_customers(self):
+        columns = self._table_columns("customer_list")
+        if not columns:
+            raise RuntimeError("Table customer_list tidak ditemukan.")
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier("customer_list"))
+                )
+                total = cur.fetchone()[0]
+
+        return {
+            "source": "postgresql",
+            "data": {"query": "customer_count", "total": total},
+            "note": "Total customer dihitung langsung dari customer_list.",
+        }
+
+    def _drawing_count_for_project(self, project_no: str):
+        columns = self._table_columns("drawinglist")
+        project_column = self._find_column(
+            columns,
+            [
+                "project_no", "projectno", "project_number",
+                "no_project", "project", "project_code",
+                "projectid", "project_id", "id_project",
+            ],
+        )
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                if project_column:
+                    cur.execute(
+                        sql.SQL(
+                            "SELECT COUNT(*) FROM drawinglist "
+                            "WHERE UPPER(CAST({} AS text)) = UPPER(%s)"
+                        ).format(sql.Identifier(project_column)),
+                        (project_no,),
+                    )
+                    total = cur.fetchone()[0]
+                    return {
+                        "source": "postgresql",
+                        "data": {
+                            "query": "drawing_count_for_project",
+                            "project_no": project_no,
+                            "total_drawing": total,
+                        },
+                        "note": "Jumlah drawing dihitung langsung dari drawinglist.",
+                    }
+
+                # Fallback: search all textual drawinglist columns for the exact project number.
+                cur.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'drawinglist'
+                      AND data_type IN ('character varying', 'character', 'text')
+                    ORDER BY ordinal_position
+                    """
+                )
+                text_columns = [row[0] for row in cur.fetchall()]
+
+                if text_columns:
+                    predicates = [
+                        sql.SQL("UPPER(CAST({} AS text)) = UPPER(%s)").format(
+                            sql.Identifier(column)
+                        )
+                        for column in text_columns
+                    ]
+                    query = sql.SQL(
+                        "SELECT COUNT(*) FROM drawinglist WHERE "
+                    ) + sql.SQL(" OR ").join(predicates)
+                    cur.execute(query, [project_no] * len(text_columns))
+                    total = cur.fetchone()[0]
+                    return {
+                        "source": "postgresql",
+                        "data": {
+                            "query": "drawing_count_for_project",
+                            "project_no": project_no,
+                            "total_drawing": total,
+                            "search_mode": "all_text_columns",
+                        },
+                        "note": "Jumlah drawing dicari pada kolom teks drawinglist.",
+                    }
+
+        return {
+            "source": "postgresql",
+            "data": [],
+            "note": f"Tidak dapat menemukan kolom penghubung drawinglist untuk {project_no}.",
         }
 
     def _project_detail(self, project_no: str):
@@ -625,20 +755,29 @@ class DatabaseService:
         return sorted(set(re.findall(r"\b(20\d{2})\b", question)))
 
     @staticmethod
-    def _extract_project_type(question: str) -> str | None:
-        match = re.search(
-            r"\b(?:type|tipe)\s*[:=]?\s*([NR])\b|\btype\s+([NR])\b",
+    def _extract_project_types(question: str) -> list[str]:
+        found: list[str] = []
+
+        for match in re.finditer(
+            r"\b(?:type|tipe)\s*[:=]?\s*([NR])\b",
             question,
             flags=re.IGNORECASE,
-        )
-        if match:
-            return (match.group(1) or match.group(2)).upper()
+        ):
+            value = match.group(1).upper()
+            if value not in found:
+                found.append(value)
 
-        if re.search(r"\bnew\b", question, flags=re.IGNORECASE):
-            return "N"
-        if re.search(r"\brepair\b|\brevisi\b|\brevision\b", question, flags=re.IGNORECASE):
-            return "R"
-        return None
+        if re.search(r"\bnew\b", question, flags=re.IGNORECASE) and "N" not in found:
+            found.append("N")
+        if re.search(r"\brepair\b|\brevisi\b|\brevision\b", question, flags=re.IGNORECASE) and "R" not in found:
+            found.append("R")
+
+        return found
+
+    @staticmethod
+    def _extract_project_type(question: str) -> str | None:
+        types = DatabaseService._extract_project_types(question)
+        return types[0] if len(types) == 1 else None
 
     def _demo_context(self, question: str):
         years = self._extract_years(question)
