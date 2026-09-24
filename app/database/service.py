@@ -180,7 +180,8 @@ class DatabaseService:
             return {
                 "source": "postgresql-error",
                 "data": [],
-                "note": f"Database query failed: {exc}",
+                "note": f"Database query failed ({type(exc).__name__}): {exc}",
+                "error_type": type(exc).__name__,
             }
 
     def schema_text(self) -> str:
@@ -207,7 +208,7 @@ class DatabaseService:
                 lines.append(f"  PRIMARY KEY: {', '.join(info['primary_key'])}")
             for fk in info["foreign_keys"]:
                 lines.append(
-                    f"  FOREIGN KEY: {fk['column']} -> "
+                    f"  {'RELATION' if fk.get('inferred') else 'FOREIGN KEY'}: {fk['column']} -> "
                     f"{fk['ref_table']}.{fk['ref_column']}"
                 )
 
@@ -218,6 +219,7 @@ class DatabaseService:
                 lines.append(
                     f"  {rel['table']}.{rel['column']} = "
                     f"{rel['ref_table']}.{rel['ref_column']}"
+                    + (" [inferred]" if rel.get("inferred") else "")
                 )
 
         return "\n".join(lines)
@@ -347,6 +349,49 @@ class DatabaseService:
                 table, {"columns": [], "primary_key": [], "foreign_keys": []}
             )["foreign_keys"].append(relation)
             relationships.append(relation)
+
+        # Some legacy Engineering schemas do not declare PostgreSQL FK constraints.
+        # Infer safe, high-confidence relationships from conventional *_id columns and
+        # exact project_no columns so the planner still understands the data model.
+        declared_keys = {
+            (rel["table"], rel["column"], rel["ref_table"], rel["ref_column"])
+            for rel in relationships
+        }
+        for table, info in tables.items():
+            for column_info in info["columns"]:
+                column = column_info["name"]
+                lower = column.lower()
+                if lower.endswith("_id") and lower != "id":
+                    base = lower[:-3]
+                    candidates = [t for t in tables if t.lower() in {base, base + "_list"}]
+                    for ref_table in candidates:
+                        ref_columns = [x["name"] for x in tables[ref_table]["columns"]]
+                        ref_column = next((x for x in ref_columns if x.lower() == "id"), None)
+                        if ref_column:
+                            key = (table, column, ref_table, ref_column)
+                            if key not in declared_keys:
+                                relationships.append({
+                                    "table": table,
+                                    "column": column,
+                                    "ref_table": ref_table,
+                                    "ref_column": ref_column,
+                                    "inferred": True,
+                                })
+                                declared_keys.add(key)
+
+                if lower == "project_no" and "projects" in tables and table != "projects":
+                    ref_columns = [x["name"] for x in tables["projects"]["columns"]]
+                    if "project_no" in ref_columns:
+                        key = (table, column, "projects", "project_no")
+                        if key not in declared_keys:
+                            relationships.append({
+                                "table": table,
+                                "column": column,
+                                "ref_table": "projects",
+                                "ref_column": "project_no",
+                                "inferred": True,
+                            })
+                            declared_keys.add(key)
 
         metadata = {"tables": tables, "relationships": relationships}
         self._metadata_cache = metadata
